@@ -15,5 +15,5 @@ import com.hmdp.entity.VoucherOrder;
 public interface IVoucherOrderService extends IService<VoucherOrder> {
     Result seckilVoucher(Long voucherId);
 
-    Result createVouc(Long voucherId,  Long userId);
+    void createVoucherOrder(VoucherOrder voucherOrder);
 }
