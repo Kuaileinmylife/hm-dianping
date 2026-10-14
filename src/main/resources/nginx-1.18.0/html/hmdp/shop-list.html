@@ -46,7 +46,7 @@
       评分 <i class="el-icon-arrow-down el-icon--right"></i>
     </div>
   </div>
-  <div class="shop-list" @scroll="onScroll">
+  <div class="shop-list" ref="shopList" @scroll="onScroll">
     <div class="shop-box" v-for="s in shops" :key="s.id" @click="toDetail(s.id)">
       <div class="shop-img"><img :src="s.images" alt=""></div>
       <div class="shop-info">
@@ -83,7 +83,9 @@
     el: "#app",
     data: {
       util,
-      isReachBottom: false,
+      loading: false,
+      finished: false,
+      queryVersion: 0,
       types: [], // 类型列表
       shops: [], // 商店列表
       typeName: "",
@@ -116,26 +118,43 @@
           })
       },
       queryShops() {
-        axios.get("/shop/of/type", {
-            params: this.params
+        if (this.loading || this.finished) return;
+        this.loading = true;
+        const version = this.queryVersion;
+        const params = Object.assign({}, this.params);
+        return axios.get("/shop/of/type", {
+            params
           })
           .then(({data}) => {
-            if (!data) {
-              return
-            }
+            // 切换排序后，丢弃之前尚未返回的请求结果。
+            if (version !== this.queryVersion) return;
+            if (!Array.isArray(data)) throw new Error("店铺列表返回格式错误");
+            this.finished = data.length === 0;
             data.forEach(s => s.images = s.images.split(',')[0]);
             this.shops = this.shops.concat(data);
+            // 成功后再推进页码，失败时可以重试当前页。
+            this.params.current = params.current + 1;
           })
           .catch(err => {
+            if (version !== this.queryVersion) return;
             console.log(err);
             this.$message.error(err)
           })
+          .finally(() => {
+            if (version === this.queryVersion) this.loading = false;
+          });
       },
       handleCommand(t) {
         location.href = "/shop-list.html?type="+t.id+"&name="+t.name;
       },
       sortAndQuery(sortBy) {
+        this.queryVersion++;
         this.params.sortBy = sortBy;
+        this.params.current = 1;
+        this.shops = [];
+        this.finished = false;
+        this.loading = false;
+        if (this.$refs.shopList) this.$refs.shopList.scrollTop = 0;
         this.queryShops();
       },
       goBack() {
@@ -148,13 +167,8 @@
         let scrollTop = e.target.scrollTop;
         let offsetHeight = e.target.offsetHeight;
         let scrollHeight = e.target.scrollHeight;
-        if(scrollTop + offsetHeight + 1 > scrollHeight && !this.isReachBottom){
-          this.isReachBottom = true
-          console.log("触底")
-          this.params.current++
-          this.queryShops(this.params.current, 5);
-        }else{
-          this.isReachBottom = false
+        if(scrollTop + offsetHeight + 1 > scrollHeight){
+          this.queryShops();
         }
       },
     }
