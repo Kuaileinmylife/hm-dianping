@@ -1,7 +1,7 @@
 package com.hmdp.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
-import cn.hutool.core.util.BooleanUtil;
+import lombok.extern.slf4j.Slf4j;
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
@@ -9,14 +9,17 @@ import com.hmdp.dto.Result;
 import com.hmdp.dto.ScrollResult;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.Blog;
+import com.hmdp.entity.BlogLike;
 import com.hmdp.entity.Follow;
 import com.hmdp.entity.User;
 import com.hmdp.mapper.BlogMapper;
+import com.hmdp.service.IBlogLikeService;
 import com.hmdp.service.IBlogService;
 import com.hmdp.service.IFollowService;
 import com.hmdp.service.IUserService;
 import com.hmdp.utils.SystemConstants;
 import com.hmdp.utils.UserHolder;
+import org.springframework.dao.DataAccessException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.stereotype.Service;
@@ -28,10 +31,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
-import static com.hmdp.utils.RedisConstants.BLOG_LIKED_KEY;
-import static com.hmdp.utils.RedisConstants.FEED_KEY;
+import static com.hmdp.utils.RedisConstants.*;
 
 /**
  * <p>
@@ -41,6 +44,7 @@ import static com.hmdp.utils.RedisConstants.FEED_KEY;
  * @author 虎哥
  * @since 2021-12-22
  */
+@Slf4j
 @Service
 public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IBlogService {
     @Resource
@@ -54,6 +58,9 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
     @Resource
     private RedissonClient redissonClient;
+
+    @Resource
+    private IBlogLikeService blogLikeService;
 
     @Override
     public Result queryBlogById(Long id) {
@@ -80,9 +87,39 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
         }
 
         // 判断当前用户是否已经点赞
-        String key = "blog:liked:" + blog.getId();
-        Double score = stringRedisTemplate.opsForZSet().score(key, user.getId().toString());
-        blog.setIsLike(score != null);
+        String key = BLOG_LIKE_STATUS_KEY + blog.getId() + ":" + user.getId();
+
+        // 先查缓存
+        try{
+            // 查当前用户是否点赞
+            String cached = stringRedisTemplate.opsForValue().get(key);
+
+            //"1"：已点赞
+            //"0"：未点赞
+            //null：没有这条缓存
+            if("1".equals(cached) || "0".equals(cached)){
+                blog.setIsLike("1".equals(cached));
+                return;
+            }
+        }catch(DataAccessException e){
+            log.warn("读取点赞状态缓存失败，改查数据库，key=" + key, e);
+        }
+
+        // 没有缓存就查数据库
+        Long count = blogLikeService.query()
+                .eq("blog_id", blog.getId())
+                .eq("user_id", user.getId())
+                .count();
+
+        boolean liked = count > 0;
+        blog.setIsLike(liked);
+
+        // 再把数据库的数据放到redis
+        try {
+            stringRedisTemplate.opsForValue().set(key, liked ? "1" : "0", 60, TimeUnit.SECONDS);
+        } catch (DataAccessException e) {
+            log.warn("写入点赞状态缓存失败，key=" + key, e);
+        }
     }
 
     private void queryBlogUser(Blog blog) {
@@ -123,19 +160,36 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
         if (!lock.tryLock()) {
             return Result.fail("操作太快，请稍后重试");
         }
+
+        // 外层：保证数据库或 Redis 操作出现异常时，都能执行解锁
         try {
-            String key = BLOG_LIKED_KEY + id;
-            String member = userId.toString();
-            Double score = stringRedisTemplate.opsForZSet().score(key, member);
-            boolean liked = score == null;
-            if (!updateLikeCount(id, liked)) {
-                return Result.fail("点赞状态更新失败，请刷新后重试");
-            }
+            // 从数据库判断是否已经点赞
+            Long count = blogLikeService.query().eq("blog_id", id).eq("user_id", userId).count();
+
+            // 记录本次操作的目标状态
+            boolean liked = count == 0;
+
+
             if (liked) {
-                stringRedisTemplate.opsForZSet().add(key, member, System.currentTimeMillis());
-            } else {
-                stringRedisTemplate.opsForZSet().remove(key, member);
+                // 调用另一个service的事务方法
+                // 保存点赞关系+数据库点赞数+1
+                blogLikeService.likeBlog(id, userId);
+            }else{
+                // 取消点赞
+                // 删除点赞关系和扣减数量，在同一个数据库事务内完成
+                blogLikeService.unlikeBlog(id, userId);
             }
+
+            // 数据库中的点赞状态已经改变，使旧状态缓存失效
+            String statusKey = BLOG_LIKE_STATUS_KEY + id + ":" + userId;
+            try {
+                stringRedisTemplate.delete(statusKey);
+            } catch (DataAccessException e) {
+                log.error("点赞状态缓存失效失败，key=" + statusKey, e);
+            }
+
+
+            // 数据库已提交；状态缓存失效失败时暂由过期时间兜底，尚无主动补偿。
             return Result.ok();
         } finally {
             // 未取得锁的请求不会进入这里；异常时也释放自己持有的锁。
@@ -143,14 +197,6 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
                 lock.unlock();
             }
         }
-    }
-
-    protected boolean updateLikeCount(Long id, boolean liked) {
-        if (liked) {
-            return update().setSql("liked = liked + 1").eq("id", id).update();
-        }
-        // 防止历史异常数据导致点赞数减为负数。
-        return update().setSql("liked = liked - 1").eq("id", id).gt("liked", 0).update();
     }
 
     @Override
@@ -233,14 +279,20 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
     @Override
     public Result queryBlogLikes(Long id) {
-        String key = BLOG_LIKED_KEY + id;
-        // 查询top5的点赞用户zrange key 0 4
-        Set<String> top5 = stringRedisTemplate.opsForZSet().range(key, 0, 4);
-        if(top5 == null || top5.isEmpty()){
+        // 查询最早点赞的5条记录
+        List<BlogLike> likes = blogLikeService.query()
+                .eq("blog_id", id)
+                .orderByAsc("create_time")
+                .orderByAsc("id")
+                .last("LIMIT 5")
+                .list();
+
+        if(likes.isEmpty()){
             return Result.ok(Collections.emptyList());
         }
+
         // 解析出其中的用户id
-        List<Long> ids = top5.stream().map(Long::valueOf).collect(Collectors.toList());
+        List<Long> ids = likes.stream().map(BlogLike::getUserId).collect(Collectors.toList());
         String idStr = StrUtil.join(",", ids);
         // 根据用户id查询用户 WHERE id IN (5,1) ORDER BY FIELD(id, 5, 1)
         List<UserDTO> users = userService.query()
@@ -253,6 +305,4 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
         // 返回
         return Result.ok(users);
     }
-
-
 }
