@@ -20,6 +20,8 @@ import com.hmdp.utils.UserHolder;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.stereotype.Service;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 
 import javax.annotation.Resource;
 import java.util.ArrayList;
@@ -49,6 +51,9 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
     @Resource
     private IFollowService followService;
+
+    @Resource
+    private RedissonClient redissonClient;
 
     @Override
     public Result queryBlogById(Long id) {
@@ -105,31 +110,47 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
     @Override
     public Result likeBlog(Long id) {
-        // 获取登录用户
-        Long userId = UserHolder.getUser().getId();
-
-        // 判断当前用户是否已经点赞
-        String key = "blog:liked:" + id;
-        Double score = stringRedisTemplate.opsForZSet().score(key, userId.toString());
-
-        if(score == null){
-            // 如果未点赞，可以点赞
-            // 数据库点赞数+1
-            boolean isSuccess = update().setSql("liked  = liked + 1").eq("id", id).update();
-            // 保存用户到redis的set集合里 zadd key value score
-            if(isSuccess){
-                stringRedisTemplate.opsForZSet().add(key, userId.toString(), System.currentTimeMillis());
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            return Result.fail("请先登录");
+        }
+        if (id == null || id <= 0) {
+            return Result.fail("笔记id无效");
+        }
+        Long userId = user.getId();
+        // 同一用户对同一笔记的判断和修改必须放在同一把锁里。
+        RLock lock = redissonClient.getLock("lock:blog:like:" + id + ":" + userId);
+        if (!lock.tryLock()) {
+            return Result.fail("操作太快，请稍后重试");
+        }
+        try {
+            String key = BLOG_LIKED_KEY + id;
+            String member = userId.toString();
+            Double score = stringRedisTemplate.opsForZSet().score(key, member);
+            boolean liked = score == null;
+            if (!updateLikeCount(id, liked)) {
+                return Result.fail("点赞状态更新失败，请刷新后重试");
             }
-        }else{
-            // 如果已点赞，取消点赞
-            // 数据库点赞数-1
-            boolean isSuccess = update().setSql("liked = liked - 1").eq("id", id).update();
-            // 移除redis里的用户
-            if(isSuccess){
-                stringRedisTemplate.opsForZSet().remove(key, userId.toString());
+            if (liked) {
+                stringRedisTemplate.opsForZSet().add(key, member, System.currentTimeMillis());
+            } else {
+                stringRedisTemplate.opsForZSet().remove(key, member);
+            }
+            return Result.ok();
+        } finally {
+            // 未取得锁的请求不会进入这里；异常时也释放自己持有的锁。
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
             }
         }
-        return Result.ok();
+    }
+
+    protected boolean updateLikeCount(Long id, boolean liked) {
+        if (liked) {
+            return update().setSql("liked = liked + 1").eq("id", id).update();
+        }
+        // 防止历史异常数据导致点赞数减为负数。
+        return update().setSql("liked = liked - 1").eq("id", id).gt("liked", 0).update();
     }
 
     @Override

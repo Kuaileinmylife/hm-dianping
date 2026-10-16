@@ -140,7 +140,6 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
             num >>>= 1;
         }
 
-
         return Result.ok(count);
     }
 
