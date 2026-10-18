@@ -16,6 +16,7 @@ public class MvcConfig implements WebMvcConfigurer {
 
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
+        // 检查需要登录的请求拦截器
         registry.addInterceptor(new LoginInterceptor())
                 .excludePathPatterns(
                         "/blog/hot",
@@ -27,6 +28,7 @@ public class MvcConfig implements WebMvcConfigurer {
                         "/user/login"
                 ).order(1);// 添加执行的优先级，值越小优先级越大
 
+        // 重置登录状态拦截器
         registry.addInterceptor(new RefreshTokenInterceptor(stringRedisTemplate)).order(0);
     }
 }

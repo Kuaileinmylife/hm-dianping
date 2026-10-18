@@ -4,6 +4,7 @@ import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.bean.copier.CopyOptions;
 import cn.hutool.core.lang.UUID;
 import cn.hutool.core.util.RandomUtil;
+import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.LoginFormDTO;
 import com.hmdp.dto.Result;
@@ -144,6 +145,20 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
     }
 
     @Override
+    public Result logout(String token) {
+        // 有token时，删除对应的redis登录信息
+        if(StrUtil.isNotBlank(token)){
+            String key = LOGIN_CODE_KEY + token;
+            stringRedisTemplate.delete(key);
+        }
+
+        // 清理当前线程中的用户
+        UserHolder.removeUser();
+
+        return Result.ok();
+    }
+
+    @Override
     public Result login(LoginFormDTO loginForm, HttpSession session) {
         // 验证手机号
         String phone = loginForm.getPhone();
@@ -153,7 +168,9 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         }
 
         // 从redis中验证验证码
+        // 后端之前生成并保存在 Redis 中的验证码
         String cacheCode = stringRedisTemplate.opsForValue().get(LOGIN_CODE_KEY + phone);
+        // 用户在页面填写、随登录请求提交的验证码
         String code = loginForm.getCode();
         if(cacheCode == null || !cacheCode.equals(code)){
             // 验证码不一致就报错
@@ -179,8 +196,8 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         // 将bean转为mapper
         Map<String, Object> userMap = BeanUtil.beanToMap(userDTO, new HashMap<>(),
                 CopyOptions.create()
-                        .setIgnoreNullValue(true)
-                        .setFieldValueEditor((fieldName, fieldValue)->fieldValue.toString())
+                        .setIgnoreNullValue(true) // 忽略值为NULL的属性
+                        .setFieldValueEditor((fieldName, fieldValue)->fieldValue.toString()) // 把所有属性转成字符串
                 );
 
         // 存储
