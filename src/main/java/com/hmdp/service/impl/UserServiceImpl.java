@@ -207,6 +207,9 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         // 设置token有效期
         stringRedisTemplate.expire(tokenKey, LOGIN_USER_TTL, TimeUnit.MINUTES);
 
+        // 用户成功登录，需要删除验证码
+        stringRedisTemplate.delete(LOGIN_CODE_KEY + phone);
+
         // 返回token
         return Result.ok(token);
     }
