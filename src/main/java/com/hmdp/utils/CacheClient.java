@@ -87,8 +87,7 @@ public class CacheClient {
                 return null; // 命中缓存的空值，防止缓存穿透
             }
 
-            RedisData redisData = StrUtil.isNotBlank(json)
-                    ? JSONUtil.toBean(json, RedisData.class) : null;
+            RedisData redisData = StrUtil.isNotBlank(json) ? JSONUtil.toBean(json, RedisData.class) : null;
             // 旧版普通 JSON 没有逻辑过期时间，也通过回源重新生成缓存。
             if (redisData == null || redisData.getExpireTime() == null) {
                 String token = tryLock(lockKey);

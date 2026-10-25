@@ -16,6 +16,7 @@ public class RedisIdWorker {
     // 序列号长度
     private static final int COUNT_BITS = 32;
 
+    // 有参构造
     public RedisIdWorker(StringRedisTemplate stringRedisTemplate) {
         this.stringRedisTemplate = stringRedisTemplate;
     }

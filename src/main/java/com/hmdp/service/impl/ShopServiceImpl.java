@@ -109,6 +109,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             }
         }
     }
+
     // 缓存穿透
     public Shop queryWithPassThrough(Long id){
         String key = CACHE_SHOP_KEY + id;
@@ -152,13 +153,14 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         return BooleanUtil.isTrue(flag) ? token : null;
     }
 
+    // lua脚本，把判断是自己的锁和删除锁写成原子操作
     private static final DefaultRedisScript<Long> UNLOCK_SCRIPT = new DefaultRedisScript<>(
             "if redis.call('get', KEYS[1]) == ARGV[1] then "
                     + "return redis.call('del', KEYS[1]) else return 0 end", Long.class);
-
     private void unlock(String key, String token) {
         stringRedisTemplate.execute(UNLOCK_SCRIPT, Collections.singletonList(key), token);
     }
+
     public void saveShop2Redis(Long id, Long expireSeconds){
         // 查询店铺数据
         Shop shop = getById(id);
