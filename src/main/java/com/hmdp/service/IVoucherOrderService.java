@@ -15,5 +15,8 @@ import com.hmdp.entity.VoucherOrder;
 public interface IVoucherOrderService extends IService<VoucherOrder> {
     Result seckilVoucher(Long voucherId);
 
+    // 查询当前登录用户的订单创建结果，尚未落库时结合 Redis 判断。
+    Result queryOrderResult(Long orderId);
+
     void createVoucherOrder(VoucherOrder voucherOrder);
 }

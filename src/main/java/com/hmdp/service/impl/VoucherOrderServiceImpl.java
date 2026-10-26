@@ -1,11 +1,15 @@
 package com.hmdp.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
+import org.apache.rocketmq.client.producer.LocalTransactionState;
 import org.apache.rocketmq.client.producer.SendResult;
 import org.apache.rocketmq.client.producer.SendStatus;
+import org.apache.rocketmq.client.producer.TransactionSendResult;
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
+import org.apache.rocketmq.spring.support.RocketMQHeaders;
 import org.springframework.core.io.ClassPathResource;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.dto.OrderResultDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
@@ -22,6 +26,8 @@ import org.springframework.aop.framework.AopContext;
 import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -254,54 +260,98 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         long orderId = redisIdWorker.nextId("order");
 
         // 提前编好订单消息
-        VoucherOrder voucherOrder = new VoucherOrder();
-        voucherOrder.setUserId(userId);
-        voucherOrder.setId(orderId);
-        voucherOrder.setVoucherId(voucherId);
+        VoucherOrder order = new VoucherOrder();
+        order.setUserId(userId);
+        order.setId(orderId);
+        order.setVoucherId(voucherId);
 
-        // 1,执行lua脚本
-        Long result = stringRedisTemplate.execute(
-                SECKILL_SCRIPT,
-                Collections.emptyList(),
-                voucherId.toString(), userId.toString(), String.valueOf(orderId)
-        );
+        Message<VoucherOrder> message = MessageBuilder
+                .withPayload(order)
+                .setHeader(RocketMQHeaders.KEYS, String.valueOf(orderId))
+                .build();
 
-        if(result == null){
-            throw new IllegalStateException("秒杀脚本未返回执行结果");
-        }
-
-        int r = result.intValue();
-
-        // 判断结果是否为0
-        if(r != 0){
-            // 不为0就有问题, 没有购买资格
-            return Result.fail(r == 1 ? "库存不足":"不能重复下单");
-        }
-
-
-        // 发送订单消息到 RocketMQ
-        try {
-            SendResult sendResult = rocketMQTemplate.syncSend( // 同步发送，会阻塞等待发送结果
-                    "seckill-order-topic",
-                    voucherOrder
+        try{
+            // 记录本次下单请求属于哪个用户
+            stringRedisTemplate.opsForValue().set(
+                    "seckill:owner:" + orderId,
+                    userId.toString()
             );
 
-            if(sendResult.getSendStatus() != SendStatus.SEND_OK){
-                log.error("订单消息发送结果待确认，orderId=" + orderId + ",result=" + sendResult);
+            // 先发送半消息
+            // 半消息发送成功后，框架调用事务监听器执行lua
+            TransactionSendResult result = rocketMQTemplate.sendMessageInTransaction(
+                    "seckill-order-tx-topic",
+                    message,
+                    null
+            );
 
-                return Result.fail("订单提交结果待确认，请勿重复抢购，订单号：" + orderId);
+            if(result.getSendStatus() != SendStatus.SEND_OK){
+                log.error("半消息发送结果待确认，orderId=" + orderId + ".result=" + result);
+
+                return Result.fail("抢购结果待确认，请勿重复提交，订单号:" + orderId);
             }
-        } catch (Exception e) {
-            log.error("订单消息发送异常，orderId=" + orderId, e);
 
-            return Result.fail("订单提交结果待确认，请勿重复抢购" + orderId);
+            // 根据本地预扣结果返回
+            LocalTransactionState state = result.getLocalTransactionState();
+
+            if (state == LocalTransactionState.COMMIT_MESSAGE) {
+                return Result.ok(orderId);
+            }
+
+            if(state == LocalTransactionState.ROLLBACK_MESSAGE){
+                return Result.fail("抢购未受理：库存不足，重复抢购或本次事务已关闭");
+            }
+
+            return Result.fail("抢购结果确认中，请勿重复提交，订单号：" + orderId);
+        }catch (Exception e){
+            log.error("发送事务消息异常，orderId=" + orderId, e);
+
+            return Result.fail("抢购结果待确认，请勿重复提交，订单号：" + orderId);
         }
 
-        // 获取代理对象
-        //proxy = (IVoucherOrderService) AopContext.currentProxy();
+//        // 1,执行lua脚本
+//        Long result = stringRedisTemplate.execute(
+//                SECKILL_SCRIPT,
+//                Collections.emptyList(),
+//                voucherId.toString(), userId.toString(), String.valueOf(orderId)
+//        );
 
-        // 返回订单id
-        return Result.ok(orderId);
+//        if(result == null){
+//            throw new IllegalStateException("秒杀脚本未返回执行结果");
+//        }
+//
+//        int r = result.intValue();
+
+//        // 判断结果是否为0
+//        if(r != 0){
+//            // 不为0就有问题, 没有购买资格
+//            return Result.fail(r == 1 ? "库存不足":"不能重复下单");
+//        }
+
+
+//        // 发送订单消息到 RocketMQ
+//        try {
+//            SendResult sendResult = rocketMQTemplate.syncSend( // 同步发送，会阻塞等待发送结果
+//                    "seckill-order-topic",
+//                    voucherOrder
+//            );
+//
+//            if(sendResult.getSendStatus() != SendStatus.SEND_OK){
+//                log.error("订单消息发送结果待确认，orderId=" + orderId + ",result=" + sendResult);
+//
+//                return Result.fail("订单提交结果待确认，请勿重复抢购，订单号：" + orderId);
+//            }
+//        } catch (Exception e) {
+//            log.error("订单消息发送异常，orderId=" + orderId, e);
+//
+//            return Result.fail("订单提交结果待确认，请勿重复抢购" + orderId);
+//        }
+//
+//        // 获取代理对象
+//        //proxy = (IVoucherOrderService) AopContext.currentProxy();
+//
+//        // 返回订单id
+//        return Result.ok(orderId);
     }
 
 //    @Override
@@ -342,6 +392,65 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 //        // 返回订单id
 //        return Result.ok(orderId);
 //    }
+
+    /**
+     * 查询当前用户的异步下单结果。
+     * 数据库订单是创建成功的依据，Redis 事务记录只表示预扣结果。
+     */
+    @Override
+    public Result queryOrderResult(Long orderId) {
+        // HTTP 请求会经过登录拦截器，这里也防止未登录时直接调用。
+        if (UserHolder.getUser() == null) {
+            return Result.fail("请先登录");
+        }
+        if (orderId == null || orderId <= 0) {
+            return Result.fail("订单号不合法");
+        }
+        Long userId = UserHolder.getUser().getId();
+        OrderResultDTO dto = new OrderResultDTO();
+        dto.setOrderId(orderId.toString());
+
+        // 同时限定订单号和用户，防止查询别人的订单。
+        // 先查 MySQL：即使 Redis 记录丢失，已落库的订单仍能确认成功。
+        VoucherOrder order = query()
+                .eq("id", orderId)
+                .eq("user_id", userId)
+                .one();
+        if (order != null) {
+            dto.setState("SUCCESS");
+            dto.setMessage("订单创建成功");
+            return Result.ok(dto);
+        }
+
+        // 尚未落库时，使用发送消息前保存的 owner 检查请求归属。
+        // 不存在和无权查询使用相同提示，不向其他用户透露下单状态。
+        String owner = stringRedisTemplate.opsForValue()
+                .get("seckill:owner:" + orderId);
+        if (!userId.toString().equals(owner)) {
+            return Result.fail("下单记录不存在或无权查询");
+        }
+
+        // 只读状态，不调用 check-seckill-tx.lua，查询接口不能关闭事务。
+        String txState = stringRedisTemplate.opsForValue()
+                .get("seckill:tx:" + orderId);
+        if ("0".equals(txState)) {
+            // 预扣成功不等于落库成功；消费延迟或重试时仍需等待。
+            dto.setState("PROCESSING");
+            dto.setMessage("已预扣库存，等待订单处理，请稍后查询");
+        } else if ("1".equals(txState)
+                || "2".equals(txState)
+                || "3".equals(txState)) {
+            // 1：库存不足；2：重复抢购；3：本次事务已关闭。
+            // 表示这次请求未受理，不表示消费者落库失败。
+            dto.setState("REJECTED");
+            dto.setMessage("本次抢购未受理");
+        } else {
+            // 记录暂未生成或已经丢失时，不能直接判定抢购失败。
+            dto.setState("UNKNOWN");
+            dto.setMessage("抢购结果暂未确认，请稍后查询");
+        }
+        return Result.ok(dto);
+    }
 
     @Override
     @Transactional

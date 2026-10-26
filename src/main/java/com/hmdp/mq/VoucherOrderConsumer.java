@@ -14,8 +14,8 @@ import javax.annotation.Resource;
 @Slf4j
 @Component
 @RocketMQMessageListener(
-        topic = "seckill-order-topic",
-        consumerGroup = "hmdp-seckill-consumer"
+        topic = "seckill-order-tx-topic",
+        consumerGroup = "hmdp-seckill-tx-consumer"
 ) // 消费者
 public class VoucherOrderConsumer implements RocketMQListener<VoucherOrder> {
     @Resource
